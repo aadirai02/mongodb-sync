@@ -7,7 +7,7 @@
 Run this before starting a restore to confirm the reference document counts captured from the latest production snapshot (via the temporary sync job pod):
 
 ```
-make -f Makefile.sync pre-sync-check
+make -f Makefile.sync pre-restore-check
 ```
 
 Expected outcome:
