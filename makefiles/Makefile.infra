@@ -47,7 +47,7 @@ create-secrets:
 	  echo "✅ STAGING Secret created"; \
 	fi
 
-deploy-k8s: create-secrets deploy-namespaces deploy-storageclass deploy-mongodb
+deploy-k8s: deploy-namespaces create-secrets deploy-storageclass deploy-mongodb
 
 deploy-namespaces:
 	@echo "📁 Creating namespaces..."
