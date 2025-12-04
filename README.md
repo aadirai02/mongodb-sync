@@ -27,7 +27,7 @@ Ensure the following tools are installed and configured:
 ## 📦 Clone the Repository
 
 ```
-git clone <repository-url>
+git clone https://github.com/aadirai02/mongodb-sync.git
 cd mongodb-sync
 ```
 
@@ -94,7 +94,8 @@ For pre-checks, verification, and rollback procedures, refer to:
 
 For architecture details, see:
 
-`DESIGN.md`
+`Design.png`
+
 ---
 
 ## ⏱ Expected Duration
