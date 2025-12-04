@@ -19,7 +19,8 @@ Ensure the following tools are installed and configured:
 - **kubectl v1.33+**  
 - **make**  
 - **git**
-- **docker** 
+- **docker**
+- **S3 Bucket**
 - **ECR Repository** (Simple docker image to install awscli in mongo:7.0 image)
 
 ---
@@ -107,4 +108,4 @@ Approximate total execution time (excluding EKS provisioning):
 - **Total:** ~10 minutes (depending on data size)
 ```
 
-🚨 Important notice – Replace the ECR URL with your own ECR repository URL 🚨
+🚨 Important notice – Replace the ECR URL and S3 bucket name with your own ECR repository URL and bucket 🚨
