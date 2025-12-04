@@ -1,0 +1,175 @@
+#!/usr/bin/make -f
+.PHONY: sync-prod scale-sync-node create-mongo-snapshot create-sync-volume deploy-sync-pod wait-sync-node sync-dump-s3 verify-sync status-sync destroy-sync
+
+export AWS_DEFAULT_REGION = us-east-1
+export PROD_CLUSTER = prod-eks-mongo
+export EXISTING_BUCKET = mongodb-sync-bucket    # Your existing bucket name
+export SYNC_VOLUME_NAME = sync-volume-$(shell date +%Y%m%d-%H%M%S)
+export SYNC_SNAPSHOT_PREFIX = mongo-prod-sync
+
+get-prod-ctx = $(shell kubectl config get-contexts -o name | grep $(PROD_CLUSTER) || echo "")
+
+sync-prod: kubeconfig scale-sync-node create-mongo-snapshot create-sync-volume deploy-sync-pod sync-dump-s3 verify-sync destroy-sync
+	@echo "✅ Complete sync pipeline executed!"
+
+scale-sync-node:
+	@echo "🔄 Scaling sync nodegroup to 1 node..."
+	@if [ -z "$(call get-prod-ctx)" ]; then echo "❌ PROD context not found"; exit 1; fi
+	@\
+	SYNC_NG=$$(aws eks list-nodegroups --cluster-name $(PROD_CLUSTER) --query 'nodegroups[?contains(@, `sync`)] | [0]' --output text); \
+	if [ -z "$$SYNC_NG" ] || [ "$$SYNC_NG" = "None" ]; then \
+	  echo "❌ Sync nodegroup not found"; \
+	  exit 1; \
+	fi; \
+	echo "🔄 Scaling nodegroup: $$SYNC_NG"; \
+	aws eks update-nodegroup-config \
+	  --cluster-name $(PROD_CLUSTER) \
+	  --nodegroup-name $$SYNC_NG \
+	  --scaling-config "minSize=1,desiredSize=1,maxSize=1"; \
+	echo "✅ Sync nodegroup $$SYNC_NG scaling initiated"
+
+wait-sync-node:
+	@echo "⏳ Waiting for sync node to be ready (max 5min)..."
+	@for i in {1..30}; do \
+		NODE=$$(kubectl get nodes --context $(call get-prod-ctx) -l role=sync,workload=data-sync -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo ""); \
+		if [ -n "$$NODE" ] && kubectl get node $$NODE --context $(call get-prod-ctx) -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q True; then \
+			echo "✅ Sync node ready: $$NODE"; \
+			break; \
+		fi; \
+		echo "⏳ Waiting... ($$i/30)"; \
+		sleep 10; \
+	done
+
+
+create-mongo-snapshot:
+	@echo "📸 Creating MongoDB volume snapshot (via tags)..."
+	@if [ -z "$(call get-prod-ctx)" ]; then echo "❌ PROD context not found"; exit 1; fi
+	@\
+	PV_NAME=$$(kubectl get pvc -n mongo -l app=mongodb --context $(call get-prod-ctx) -o jsonpath='{.items[0].spec.volumeName}'); \
+	VOLUME_ID=$$(aws ec2 describe-volumes \
+	  --filters "Name=tag:CSIVolumeName,Values=$$PV_NAME" \
+	  --query 'Volumes[0].VolumeId' --output text); \
+	SNAP_NAME="$(SYNC_SNAPSHOT_PREFIX)-$$(date +%Y%m%d)"; \
+	echo "$$SNAP_NAME" > .last_snapshot_name; \
+	SNAPSHOT_ID=$$(aws ec2 create-snapshot \
+	  --volume-id $$VOLUME_ID \
+	  --description "MongoDB prod snapshot for sync - $$SNAP_NAME" \
+	  --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=$$SNAP_NAME},{Key=Environment,Value=prod}]" \
+	  --query 'SnapshotId' --output text); \
+	echo "✅ Snapshot creation initiated: $$SNAPSHOT_ID (Name=$$SNAP_NAME)"; \
+	for i in $$(seq 1 30); do \
+	  STATE=$$(aws ec2 describe-snapshots --snapshot-ids $$SNAPSHOT_ID --query 'Snapshots[0].State' --output text); \
+	  echo "⏳ Snapshot state: $$STATE ($$i/30)"; \
+	  if [ "$$STATE" = "completed" ]; then break; fi; \
+	  sleep 5; \
+	done; \
+	if [ "$$STATE" != "completed" ]; then echo "❌ Snapshot $$SNAPSHOT_ID not completed"; exit 1; fi; \
+	echo "✅ Snapshot $$SNAPSHOT_ID ready"
+
+create-sync-volume:
+	@echo "💾 Creating sync volume from snapshot..."
+	@if [ -z "$(call get-prod-ctx)" ]; then echo "❌ PROD context not found"; exit 1; fi
+	@\
+	if [ ! -f .last_snapshot_name ]; then echo "❌ .last_snapshot_name not found; run create-mongo-snapshot first"; exit 1; fi; \
+	SNAP_NAME=$$(cat .last_snapshot_name); \
+	SNAPSHOT_ID=$$(aws ec2 describe-snapshots \
+	  --filters "Name=tag:Name,Values=$$SNAP_NAME" \
+	  --query 'Snapshots[0].SnapshotId' --output text); \
+	VOLUME_NAME="sync-volume-from-$$SNAP_NAME"; \
+	VOLUME_ID=$$(aws ec2 create-volume \
+	  --availability-zone us-east-1a \
+	  --snapshot-id $$SNAPSHOT_ID \
+	  --volume-type gp3 \
+	  --size 10 \
+	  --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=$$VOLUME_NAME},{Key=Purpose,Value=sync-mongo}]" \
+	  --query 'VolumeId' --output text); \
+	echo "$$SNAP_NAME" > .last_snapshot_name; \
+	echo "✅ Sync volume created: $$VOLUME_ID (Name=$$VOLUME_NAME)"
+
+deploy-sync-pod:
+	@echo "🚀 Deploying sync pod with snapshot volume..."
+	@if [ -z "$(call get-prod-ctx)" ]; then echo "❌ PROD context not found"; exit 1; fi
+	@\
+	if [ ! -f .last_snapshot_name ]; then echo "❌ .last_snapshot_name not found; run create-mongo-snapshot first"; exit 1; fi; \
+	SNAP_NAME=$$(cat .last_snapshot_name); \
+	VOLUME_NAME="sync-volume-from-$$SNAP_NAME"; \
+	echo "🔎 Looking up EBS volume by Name=$$VOLUME_NAME"; \
+	VOLUME_ID=$$(aws ec2 describe-volumes \
+	  --filters "Name=tag:Name,Values=$$VOLUME_NAME" \
+	  --query 'Volumes[0].VolumeId' --output text); \
+	echo "💾 Using EBS volume: $$VOLUME_ID"; \
+	if [ -z "$$VOLUME_ID" ] || [ "$$VOLUME_ID" = "None" ]; then echo "❌ Sync EBS volume not found"; exit 1; fi; \
+	echo "🧹 Deleting old Job/PV/PVC if present..."; \
+	kubectl delete job sync-job -n sync --context $(call get-prod-ctx) --ignore-not-found=true; \
+	kubectl delete pvc sync-pvc -n sync --context $(call get-prod-ctx) --ignore-not-found=true; \
+	kubectl delete pv sync-pv --context $(call get-prod-ctx) --ignore-not-found=true; \
+	echo "📦 Creating PV/PVC/Job for volume $$VOLUME_ID"; \
+	sed "s/VOLUME_ID_PLACEHOLDER/$$VOLUME_ID/g" ../k8s/04-sync-pod.yaml | \
+	  kubectl apply -f - --context $(call get-prod-ctx) --validate=false; \
+	echo "⏳ Waiting for sync job to complete..."; \
+	kubectl wait --for=condition=Complete job/sync-job -n sync --context $(call get-prod-ctx) --timeout=900s; \
+	echo "💾 Extracting document counts from sync job..."; \
+	kubectl logs job/sync-job -n sync --context $(call get-prod-ctx) | grep -E "DOC_COUNT_.*=" | tee .sync_doc_counts; \
+	if [ ! -f .sync_doc_counts ] || [ ! -s .sync_doc_counts ]; then \
+	  echo "❌ Document counts not found in sync job logs"; exit 1; \
+	fi; \
+	echo "✅ Document counts saved to .sync_doc_counts"
+
+sync-dump-s3:
+	@echo "📤 Starting anonymized dump to S3..."
+	@if [ -z "$(call get-prod-ctx)" ]; then echo "❌ PROD context not found"; exit 1; fi
+	@\
+	echo "⏳ Waiting for sync job completion..."; \
+	kubectl wait --for=condition=Complete job/sync-job -n sync --context $(call get-prod-ctx) --timeout=1200s; \
+	POD=$$(kubectl get pod -n sync --context $(call get-prod-ctx) -l job-name=sync-job -o jsonpath='{.items[0].metadata.name}'); \
+	echo "📜 Streaming logs from pod: $$POD"; \
+	kubectl logs -f $$POD -n sync --context $(call get-prod-ctx)
+
+verify-sync:
+	@echo "🔍 === SYNC VERIFICATION ==="
+	@if [ -n "$(call get-prod-ctx)" ]; then \
+	  echo "Sync Node:"; \
+	  kubectl get nodes --show-labels -l role=sync --context $(call get-prod-ctx); \
+	  echo "Sync Pod:"; \
+	  kubectl get pods -n sync --context $(call get-prod-ctx); \
+	  echo "Sync PVC:"; \
+	  kubectl get pvc -n sync --context $(call get-prod-ctx); \
+	  echo ""; \
+	  ../scripts/verify_s3_today.sh $(EXISTING_BUCKET); \
+	fi
+
+destroy-sync:
+	@echo "🗑️ Cleaning up sync resources..."
+	@if [ -z "$(call get-prod-ctx)" ]; then echo "❌ PROD context not found"; exit 1; fi
+	@\
+	# Lookup sync nodegroup dynamically
+	SYNC_NG=$$(aws eks list-nodegroups --cluster-name $(PROD_CLUSTER) --query 'nodegroups[?contains(@, `sync`)] | [0]' --output text); \
+	echo "🔎 Using sync nodegroup: $$SYNC_NG"; \
+	\
+	echo "🔎 Deleting sync Job and pods..."; \
+	kubectl delete job sync-job -n sync --context $(call get-prod-ctx) --ignore-not-found=true; \
+	kubectl delete pod -n sync --context $(call get-prod-ctx) -l job-name=sync-job --ignore-not-found=true; \
+	\
+	echo "🔎 Deleting PVC/PV..."; \
+	kubectl delete pvc sync-pvc -n sync --context $(call get-prod-ctx) --ignore-not-found=true; \
+	kubectl delete pv sync-pv --context $(call get-prod-ctx) --ignore-not-found=true; \
+	\
+	echo "🔽 Scaling sync nodegroup to 0..."; \
+	if [ -n "$$SYNC_NG" ] && [ "$$SYNC_NG" != "None" ]; then \
+	  aws eks update-nodegroup-config --cluster-name $(PROD_CLUSTER) --nodegroup-name $$SYNC_NG --scaling-config "minSize=0,desiredSize=0,maxSize=1"; \
+	  echo "✅ Sync nodegroup $$SYNC_NG scaled to 0"; \
+	else \
+	  echo "❌ Sync nodegroup not found, cannot scale to 0"; \
+	fi;
+
+kubeconfig:
+	aws eks update-kubeconfig --region us-east-1 --name $(PROD_CLUSTER)
+
+pre-sync-check:
+	@echo "🔍 === PRE-SYNC CHECK ==="
+	@if [ ! -f .sync_doc_counts ]; then \
+		echo "❌ .sync_doc_counts not found. Run 'make -f Makefile.sync deploy-sync-pod' first"; \
+		exit 1; \
+	fi
+	@echo "✅ Found .sync_doc_counts (previous sync document counts):"
+	@cat .sync_doc_counts

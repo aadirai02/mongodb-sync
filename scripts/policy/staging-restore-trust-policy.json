@@ -1,0 +1,18 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::561030001202:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/E9F68EB83C35784CDA6F5DC853BD36CE"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.us-east-1.amazonaws.com/id/E9F68EB83C35784CDA6F5DC853BD36CE:sub": "system:serviceaccount:mongo:mongo-sa",
+          "oidc.eks.us-east-1.amazonaws.com/id/E9F68EB83C35784CDA6F5DC853BD36CE:aud": "sts.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

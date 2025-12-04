@@ -1,0 +1,152 @@
+#!/usr/bin/make -f
+.PHONY: all staging-restore dump-current pull-latest-s3 restore-mongo verify-restore rollback-restore status-staging destroy-staging-rbac
+
+export AWS_DEFAULT_REGION = us-east-1
+export STAGING_CLUSTER = staging-eks-mongo
+export SYNC_BUCKET = mongodb-sync-bucket
+export BACKUPS_DIR = ../backups
+
+get-staging-ctx = $(shell kubectl config get-contexts -o name | grep $(STAGING_CLUSTER) || echo "")
+
+all: staging-restore verify-restore
+
+staging-restore: dump-current pull-latest-s3 restore-mongo verify-restore
+	@echo "✅ Complete staging restore pipeline executed!"
+
+dump-current:
+	@echo "🌱 Dumping current staging MongoDB data for failover backup..."
+	@if [ -z "$(call get-staging-ctx)" ]; then echo "❌ STAGING context not found"; exit 1; fi
+	@\
+	mkdir -p $(BACKUPS_DIR); \
+	POD=$$(kubectl get pod -n mongo --context $(call get-staging-ctx) -l app=mongodb -o jsonpath='{.items[0].metadata.name}'); \
+	echo "➡ Using staging pod: $$POD"; \
+	PASS=$$(kubectl get secret mongo-secret -n mongo --context $(call get-staging-ctx) -o jsonpath='{.data.MONGO_INITDB_ROOT_PASSWORD}' | base64 -d); \
+	kubectl exec -n mongo $$POD --context $(call get-staging-ctx) -- \
+	  mongodump --host localhost:27017 -u admin -p $$PASS --authenticationDatabase admin \
+	    --db testdb --archive=/tmp/current-staging.archive --gzip; \
+	kubectl cp mongo/$$POD:/tmp/current-staging.archive $(BACKUPS_DIR)/current-staging-$(shell date +%Y%m%d-%H%M%S).archive.gz \
+	  --context $(call get-staging-ctx); \
+	echo "✅ Current staging data backed up to $(BACKUPS_DIR)/"
+
+pull-latest-s3:
+	@echo "📥 Pulling LATEST sync dump from S3..."
+	@if [ -z "$(call get-staging-ctx)" ]; then echo "❌ STAGING context not found"; exit 1; fi
+	@\
+	mkdir -p $(BACKUPS_DIR); \
+	LATEST_FOLDER=$$(aws s3 ls s3://$(SYNC_BUCKET)/ | tail -1 | awk '{print $$2}' | sed 's:\/$$::'); \
+	if [ -z "$$LATEST_FOLDER" ]; then echo "❌ No folders found in S3 bucket $(SYNC_BUCKET)"; exit 1; fi; \
+	echo "📁 Using latest folder: $$LATEST_FOLDER"; \
+	aws s3 cp s3://$(SYNC_BUCKET)/$$LATEST_FOLDER/users-anon.gz $(BACKUPS_DIR)/users-anon.gz; \
+	aws s3 cp s3://$(SYNC_BUCKET)/$$LATEST_FOLDER/posts-anon.gz $(BACKUPS_DIR)/posts-anon.gz; \
+	echo "✅ Latest dumps downloaded to $(BACKUPS_DIR)/"
+
+restore-mongo:
+	@echo "🔄 Restoring LATEST dump into staging MongoDB..."
+	@if [ -z "$(call get-staging-ctx)" ]; then echo "❌ STAGING context not found"; exit 1; fi
+	@if [ ! -f "$(BACKUPS_DIR)/users-anon.gz" ] || [ ! -f "$(BACKUPS_DIR)/posts-anon.gz" ]; then \
+	  echo "❌ S3 dump files not found in $(BACKUPS_DIR)/"; exit 1; \
+	fi
+	@\
+	POD=$$(kubectl get pod -n mongo --context $(call get-staging-ctx) -l app=mongodb -o jsonpath='{.items[0].metadata.name}'); \
+	echo "➡ Using staging pod: $$POD"; \
+	PASS=$$(kubectl get secret mongo-secret -n mongo --context $(call get-staging-ctx) -o jsonpath='{.data.MONGO_INITDB_ROOT_PASSWORD}' | base64 -d); \
+	\
+	echo "📤 Copying users dump..."; \
+	kubectl cp $(BACKUPS_DIR)/users-anon.gz mongo/$$POD:/tmp/users-anon.gz --context $(call get-staging-ctx); \
+	echo "🔄 Restoring users collection..."; \
+	kubectl exec -n mongo $$POD --context $(call get-staging-ctx) -- \
+	  mongorestore --host localhost:27017 -u admin -p $$PASS --authenticationDatabase admin \
+	    --nsInclude=testdb.users --drop --gzip --archive=/tmp/users-anon.gz; \
+	\
+	echo "📤 Copying posts dump..."; \
+	kubectl cp $(BACKUPS_DIR)/posts-anon.gz mongo/$$POD:/tmp/posts-anon.gz --context $(call get-staging-ctx); \
+	echo "🔄 Restoring posts collection..."; \
+	kubectl exec -n mongo $$POD --context $(call get-staging-ctx) -- \
+	  mongorestore --host localhost:27017 -u admin -p $$PASS --authenticationDatabase admin \
+	    --nsInclude=testdb.posts --drop --gzip --archive=/tmp/posts-anon.gz; \
+	echo "✅ Staging MongoDB restored from latest S3 dump"
+
+verify-restore:
+	@echo "🔍 === STAGING RESTORE VERIFICATION WITH PROD SYNC COUNTS ==="
+	@if [ ! -f .sync_doc_counts ]; then \
+	  echo "❌ .sync_doc_counts not found. Run 'make -f Makefile.sync sync-prod' first"; \
+	  exit 1; \
+	fi
+	@if [ -n "$(call get-staging-ctx)" ]; then \
+	  POD=$$(kubectl get pod -n mongo --context $(call get-staging-ctx) -l app=mongodb -o jsonpath='{.items[0].metadata.name}'); \
+	  PASS=$$(kubectl get secret mongo-secret -n mongo --context $(call get-staging-ctx) -o jsonpath='{.data.MONGO_INITDB_ROOT_PASSWORD}' | base64 -d); \
+	  echo "Staging Mongo Pod: $$POD"; \
+	  kubectl get pod -n mongo --context $(call get-staging-ctx); \
+	  \
+	  echo "📊 Expected counts from sync-job (prod reference):"; \
+	  cat .sync_doc_counts; \
+	  \
+	  echo "🔢 Actual staging counts:"; \
+	  STAGING_USERS=$$(kubectl exec -n mongo $$POD --context $(call get-staging-ctx) -- \
+	    mongosh --host localhost:27017 -u admin -p $$PASS --authenticationDatabase admin testdb --quiet --eval "db.users.countDocuments()" | grep -o '[0-9]\+'); \
+	  STAGING_POSTS=$$(kubectl exec -n mongo $$POD --context $(call get-staging-ctx) -- \
+	    mongosh --host localhost:27017 -u admin -p $$PASS --authenticationDatabase admin testdb --quiet --eval "db.posts.countDocuments()" | grep -o '[0-9]\+'); \
+	  echo "Staging users: $$STAGING_USERS"; \
+	  echo "Staging posts: $$STAGING_POSTS"; \
+	  \
+	  EXPECTED_USERS=$$(grep "DOC_COUNT_users=" .sync_doc_counts | cut -d= -f2); \
+	  EXPECTED_POSTS=$$(grep "DOC_COUNT_posts=" .sync_doc_counts | cut -d= -f2); \
+	  \
+	  if [ "$$STAGING_USERS" != "$$EXPECTED_USERS" ] || [ "$$STAGING_POSTS" != "$$EXPECTED_POSTS" ]; then \
+	    echo "❌ ❌ RESTORE VERIFICATION FAILED!"; \
+	    echo "Expected: users=$$EXPECTED_USERS, posts=$$EXPECTED_POSTS"; \
+	    echo "Actual:   users=$$STAGING_USERS, posts=$$STAGING_POSTS"; \
+	    echo "💾 Backup available: $$(ls -la ../backups/current-staging-*.archive.gz | tail -1)"; \
+	    echo "🔄 Run: make -f Makefile.restore rollback-restore"; \
+	    exit 1; \
+	  fi; \
+	  echo "✅ ✅ PERFECT MATCH! users=$$STAGING_USERS/$$EXPECTED_USERS, posts=$$STAGING_POSTS/$$EXPECTED_POSTS"; \
+	fi
+
+rollback-restore:
+	@echo "🔄 ROLLING BACK staging to previous backup..."
+
+	@if [ -z "$(call get-staging-ctx)" ]; then \
+		echo "❌ STAGING context not found"; exit 1; \
+	fi
+
+	@echo "👉 Searching for latest backup in $(BACKUPS_DIR)..."; \
+	LATEST_BACKUP=$$(ls -t $(BACKUPS_DIR)/current-staging-*.archive.gz | head -1); \
+	echo "📦 Latest backup detected: $$LATEST_BACKUP"; \
+	\
+	POD=$$(kubectl get pod -n mongo --context $(call get-staging-ctx) -l app=mongodb -o jsonpath='{.items[0].metadata.name}'); \
+	echo "📌 Target pod: $$POD"; \
+	\
+	PASS=$$(kubectl get secret mongo-secret -n mongo --context $(call get-staging-ctx) -o jsonpath='{.data.MONGO_INITDB_ROOT_PASSWORD}' | base64 -d); \
+	echo "🔑 Password loaded"; \
+	\
+	echo "📤 Copying backup to pod..."; \
+	kubectl cp "$$LATEST_BACKUP" "mongo/$$POD:/tmp/rollback.archive.gz" --context $(call get-staging-ctx); \
+	\
+	echo "🔄 Restoring backup inside pod..."; \
+	kubectl exec -n mongo $$POD --context $(call get-staging-ctx) -- \
+		mongorestore \
+			--host localhost:27017 \
+			-u admin -p "$$PASS" \
+			--authenticationDatabase admin \
+			--drop \
+			--gzip \
+			--archive=/tmp/rollback.archive.gz; \
+	\
+	echo "✅ Rollback completed from $$LATEST_BACKUP"
+
+status-staging:
+	@echo "📊 Staging MongoDB status:"
+	@if [ -n "$(call get-staging-ctx)" ]; then \
+	  kubectl get pods -n mongo --context $(call get-staging-ctx); \
+	  kubectl get pvc -n mongo --context $(call get-staging-ctx); \
+	fi
+
+destroy-staging-rbac:
+	@echo "🗑️ Cleaning up staging restore resources..."
+	@if [ -n "$(call get-staging-ctx)" ]; then \
+	  kubectl delete job sync-job -n mongo --context $(call get-staging-ctx) --ignore-not-found=true; \
+	  kubectl delete pod -n mongo -l job-name=sync-job --context $(call get-staging-ctx) --ignore-not-found=true; \
+	  rm -rf $(BACKUPS_DIR)/*; \
+	fi
+

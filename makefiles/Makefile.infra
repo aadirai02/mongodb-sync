@@ -1,0 +1,128 @@
+#!/usr/bin/make -f
+.PHONY: all deploy kubeconfig deploy-k8s verify status destroy
+
+export AWS_DEFAULT_REGION = us-east-1
+export PROD_CLUSTER = prod-eks-mongo
+export STAGING_CLUSTER = staging-eks-mongo
+
+# Dynamic context lookup (evaluated at runtime)
+get-prod-ctx = $(shell kubectl config get-contexts -o name | grep $(PROD_CLUSTER) || echo "")
+get-staging-ctx = $(shell kubectl config get-contexts -o name | grep $(STAGING_CLUSTER) || echo "")
+FILE_PATH = /data/db
+
+all: deploy kubeconfig deploy-k8s verify seed-prod-mongo
+
+deploy:
+	@echo "🚀 Deploying EKS Clusters..."
+	cd ../terraform/prod && terraform init -upgrade && terraform apply -auto-approve
+	cd ../terraform/staging && terraform init -upgrade && terraform apply -auto-approve
+
+kubeconfig:
+	aws eks update-kubeconfig --region us-east-1 --name $(PROD_CLUSTER)
+	aws eks update-kubeconfig --region us-east-1 --name $(STAGING_CLUSTER)
+	@echo "✅ Contexts ready!"
+	@echo "PROD CTX: $(call get-prod-ctx)"
+	@echo "STAGING CTX: $(call get-staging-ctx)"
+
+create-secrets:
+	@echo "🔑 Creating MongoDB secrets..."
+	@if [ -n "$(call get-prod-ctx)" ]; then \
+	  PASS=$$(openssl rand -hex 8); \
+	  echo "🔑 PROD MongoDB Password: $$PASS"; \
+	  kubectl create secret generic mongo-secret \
+	    --from-literal=MONGO_INITDB_ROOT_USERNAME=admin \
+	    --from-literal=MONGO_INITDB_ROOT_PASSWORD=$$PASS \
+	    -n mongo --context $(call get-prod-ctx) --dry-run=client -o yaml | \
+	    kubectl apply -f - --context $(call get-prod-ctx) --validate=false; \
+	  echo "✅ PROD Secret created"; \
+	fi
+	@if [ -n "$(call get-staging-ctx)" ]; then \
+	  PASS=$$(openssl rand -hex 8); \
+	  echo "🔑 STAGING MongoDB Password: $$PASS"; \
+	  kubectl create secret generic mongo-secret \
+	    --from-literal=MONGO_INITDB_ROOT_USERNAME=admin \
+	    --from-literal=MONGO_INITDB_ROOT_PASSWORD=$$PASS \
+	    -n mongo --context $(call get-staging-ctx) --dry-run=client -o yaml | \
+	    kubectl apply -f - --context $(call get-staging-ctx) --validate=false; \
+	  echo "✅ STAGING Secret created"; \
+	fi
+
+deploy-k8s: create-secrets deploy-namespaces deploy-storageclass deploy-mongodb
+
+deploy-namespaces:
+	@echo "📁 Creating namespaces..."
+	@if [ -n "$(call get-prod-ctx)" ]; then \
+	  kubectl create namespace mongo --context $(call get-prod-ctx) --dry-run=client -o yaml | kubectl apply -f - --context $(call get-prod-ctx) --validate=false; \
+	  kubectl create namespace sync --context $(call get-prod-ctx) --dry-run=client -o yaml | kubectl apply -f - --context $(call get-prod-ctx) --validate=false; \
+	fi
+	@if [ -n "$(call get-staging-ctx)" ]; then \
+	  kubectl create namespace mongo --context $(call get-staging-ctx) --dry-run=client -o yaml | kubectl apply -f - --context $(call get-staging-ctx) --validate=false; \
+	  kubectl create namespace sync --context $(call get-staging-ctx) --dry-run=client -o yaml | kubectl apply -f - --context $(call get-staging-ctx) --validate=false; \
+	fi
+	@echo "✅ Namespaces created"
+
+deploy-mongodb:
+	@echo "🐳 Deploying MongoDB..."
+	@if [ -n "$(call get-prod-ctx)" ]; then kubectl apply -f ../k8s/02-mongodb-prod.yaml --context $(call get-prod-ctx) --validate=false; fi
+	@if [ -n "$(call get-staging-ctx)" ]; then kubectl apply -f ../k8s/03-mongodb-staging.yaml --context $(call get-staging-ctx) --validate=false; fi
+	@echo "⏳ Waiting for PVCs (30 sec)..."
+	sleep 30
+	@echo "✅ MongoDB deployed"
+
+deploy-storageclass:
+	@echo "💾 Deploying StorageClass..."
+	@if [ -n "$(call get-prod-ctx)" ]; then kubectl apply -f ../k8s/01-namespaces-storageclass.yaml --context $(call get-prod-ctx) --validate=false; fi
+	@if [ -n "$(call get-staging-ctx)" ]; then kubectl apply -f ../k8s/01-namespaces-storageclass.yaml --context $(call get-staging-ctx) --validate=false; fi
+	@echo "✅ StorageClass deployed"
+
+verify:
+	@echo "🔍 === PROD CLUSTER ==="
+	@if [ -n "$(call get-prod-ctx)" ]; then \
+	  kubectl get nodes --show-labels --context $(call get-prod-ctx) || true; \
+	  kubectl get pvc -n mongo --context $(call get-prod-ctx) || true; \
+	  kubectl get pods -n mongo --context $(call get-prod-ctx) || true; \
+	fi
+	@echo ""
+	@echo "🔍 === STAGING CLUSTER ==="
+	@if [ -n "$(call get-staging-ctx)" ]; then \
+	  kubectl get nodes --show-labels --context $(call get-staging-ctx) || true; \
+	  kubectl get pvc -n mongo --context $(call get-staging-ctx) || true; \
+	  kubectl get pods -n mongo --context $(call get-staging-ctx) || true; \
+	fi
+
+status:
+	aws eks list-nodegroups --cluster-name $(PROD_CLUSTER) --output table
+	aws eks list-nodegroups --cluster-name $(STAGING_CLUSTER) --output table
+
+destroy:
+	cd ../terraform/staging && terraform destroy -auto-approve
+	cd ../terraform/prod && terraform destroy -auto-approve
+
+# Path inside the pod where EFS is mounted
+
+seed-prod-mongo:
+	@echo "🌱 Seeding PROD MongoDB data into EFS..."
+	@if [ -z "$(call get-prod-ctx)" ]; then \
+	  echo "❌ PROD context not found"; exit 1; \
+	fi; \
+	POD=$$(kubectl get pod -n mongo --context $(call get-prod-ctx) -l app=mongodb -o jsonpath='{.items[0].metadata.name}'); \
+	echo "➡ Using pod: $$POD"; \
+	echo "📥 Copying JSON files into pod EFS path..."; \
+	kubectl cp ../data/users.json $$POD:$(FILE_PATH)/users.json -n mongo --context $(call get-prod-ctx); \
+	kubectl cp ../data/posts.json $$POD:$(FILE_PATH)/posts.json -n mongo --context $(call get-prod-ctx); \
+	echo "🔐 Fetching MongoDB password from secret..."; \
+	PASS=$$(kubectl get secret mongo-secret -n mongo --context $(call get-prod-ctx) -o jsonpath='{.data.MONGO_INITDB_ROOT_PASSWORD}' | base64 -d); \
+	echo "📥 Importing users collection..."; \
+	kubectl exec -n mongo --context $(call get-prod-ctx) $$POD -- \
+	  mongoimport --host localhost:27017 -u admin -p $$PASS \
+	    --authenticationDatabase admin \
+	    --db testdb --collection users \
+	    --file $(FILE_PATH)/users.json --jsonArray; \
+	echo "📥 Importing posts collection..."; \
+	kubectl exec -n mongo --context $(call get-prod-ctx) $$POD -- \
+	  mongoimport --host localhost:27017 -u admin -p $$PASS \
+	    --authenticationDatabase admin \
+	    --db testdb --collection posts \
+	    --file $(FILE_PATH)/posts.json --jsonArray; \
+	echo "✅ PROD MongoDB seeded."
+

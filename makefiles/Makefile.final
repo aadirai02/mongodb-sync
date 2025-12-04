@@ -1,0 +1,38 @@
+# Makefile.all - Run full pipeline end-to-end
+
+.PHONY: all init_terraform infra irsa restore sync
+
+# Main target
+all: init_terraform infra irsa sync restore
+
+#############################################
+# Terraform Init
+#############################################
+init_terraform:
+	cd ../terraform/modules/eks && terraform init
+
+#############################################
+# Infra build
+#############################################
+infra:
+	make -f Makefile.infra all
+
+#############################################
+# IRSA setup
+#############################################
+irsa:
+	bash ../scripts/setup-irsa-staging-restore.sh
+	bash ../scripts/setup-irsa-sync.sh
+
+#############################################
+# Sync prod data
+#############################################
+sync:
+	make -f Makefile.sync sync-prod
+
+#############################################
+# Restore staging from backup
+#############################################
+restore:
+	make -f Makefile.restore all
+
