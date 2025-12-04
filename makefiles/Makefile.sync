@@ -165,7 +165,7 @@ destroy-sync:
 kubeconfig:
 	aws eks update-kubeconfig --region us-east-1 --name $(PROD_CLUSTER)
 
-pre-sync-check:
+pre-restore-check:
 	@echo "🔍 === PRE-SYNC CHECK ==="
 	@if [ ! -f .sync_doc_counts ]; then \
 		echo "❌ .sync_doc_counts not found. Run 'make -f Makefile.sync deploy-sync-pod' first"; \
